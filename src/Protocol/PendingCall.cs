@@ -7,21 +7,35 @@ using System.Threading;
 
 namespace DBus.Protocol
 {
-	public class PendingCall : IAsyncResult
+	public class PendingCall : IAsyncResult, IDisposable
 	{
-		Connection conn;
-		Message reply;
-		ManualResetEvent waitHandle;
-		bool completedSync;
-		bool keepFDs;
-		
+		private Connection conn;
+		private Message reply;
+		private readonly ManualResetEvent waitHandle = new ManualResetEvent (false);
+		private bool completedSync = false;
+		private bool keepFDs;
+		private readonly CancellationTokenSource stopWait = new CancellationTokenSource();
+		private bool stopWaitDisposed = false;
+
 		public event Action<Message> Completed;
 
-		public PendingCall (Connection conn) : this (conn, false) {}
+		public PendingCall(Connection conn)
+			: this (conn, false)
+		{
+		}
+
 		public PendingCall (Connection conn, bool keepFDs)
 		{
 			this.conn = conn;
 			this.keepFDs = keepFDs;
+		}
+
+		public void Dispose()
+		{
+			lock (stopWait) {
+				stopWaitDisposed = true;
+				stopWait.Dispose ();
+			}
 		}
 
 		internal bool KeepFDs
@@ -33,36 +47,27 @@ namespace DBus.Protocol
 
 		public Message Reply {
 			get {
-				if (reply != null)
-					return reply;
-
-				if (Thread.CurrentThread == conn.mainThread) {
-					while (reply == null)
-						conn.HandleMessage (conn.Transport.ReadMessage ());
-
-					completedSync = true;
-
-					conn.DispatchSignals ();
-				} else {
-					if (waitHandle == null)
-						Interlocked.CompareExchange (ref waitHandle, new ManualResetEvent (false), null);
-
-					while (reply == null)
-						waitHandle.WaitOne ();
-
-					completedSync = false;
+				while (reply == null) {
+					try {
+						conn.Iterate (stopWait.Token);
+					}
+					catch (OperationCanceledException) {
+					}
 				}
-
 				return reply;
-			} 
+			}
+
 			set {
 				if (reply != null)
 					throw new Exception ("Cannot handle reply more than once");
-
 				reply = value;
 
-				if (waitHandle != null)
-					waitHandle.Set ();
+				waitHandle.Set ();
+				
+				lock (stopWait) {
+					if (!stopWaitDisposed)
+						stopWait.Cancel ();
+				}
 
 				if (Completed != null)
 					Completed (reply);
@@ -84,9 +89,6 @@ namespace DBus.Protocol
 
 		WaitHandle IAsyncResult.AsyncWaitHandle {
 			get {
-				if (waitHandle == null)
-					waitHandle = new ManualResetEvent (false);
-
 				return waitHandle;
 			}
 		}
