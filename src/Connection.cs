@@ -6,6 +6,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Reflection;
 
 namespace DBus
@@ -42,9 +43,11 @@ namespace DBus
 		public delegate void MonitorEventHandler (Message msg);
 		public MonitorEventHandler Monitors; // subscribe yourself to this list of observers if you want to get notified about each incoming message
 
+		private ManualResetEventSlim iterateEvent = MakeNewEventToNextIterate ();
+		private readonly object iterateLocker = new object ();
+
 		protected Connection ()
 		{
-
 		}
 
 		internal Connection (Transport transport)
@@ -183,11 +186,12 @@ namespace DBus
 
 		internal Message SendWithReplyAndBlock (Message msg, bool keepFDs)
 		{
-			PendingCall pending = SendWithReply (msg, keepFDs);
-			return pending.Reply;
+			using (PendingCall pending = SendWithPendingReply (msg, keepFDs)) {
+				return pending.Reply;
+			}
 		}
 
-		internal PendingCall SendWithReply (Message msg, bool keepFDs)
+		internal PendingCall SendWithPendingReply (Message msg, bool keepFDs)
 		{
 			msg.ReplyExpected = true;
 
@@ -232,10 +236,30 @@ namespace DBus
 
 		public void Iterate ()
 		{
-			Message msg = transport.ReadMessage ();
+			Iterate (new CancellationToken (false));
+		}
 
-			HandleMessage (msg);
-			DispatchSignals ();
+		Task Task = null;
+		object TaskLock = new object ();
+
+		public void Iterate (CancellationToken stopWaitToken)
+		{
+			lock (TaskLock) {
+				if (Task == null || Task.IsCompleted) {
+					Task = Task.Run ( () => {
+						var msg = transport.ReadMessage ();
+						HandleMessage (msg);
+						DispatchSignals ();
+					});
+				}
+			}
+
+			Task.Wait (stopWaitToken);
+		}
+
+		private static ManualResetEventSlim MakeNewEventToNextIterate ()
+		{
+			return new ManualResetEventSlim (true);
 		}
 
 		internal virtual void HandleMessage (Message msg)
@@ -251,21 +275,19 @@ namespace DBus
 			try {
 
 				//TODO: Restrict messages to Local ObjectPath?
-
 				{
-					object field_value = msg.Header[FieldCode.ReplySerial];
+					object field_value = msg.Header [FieldCode.ReplySerial];
 					if (field_value != null) {
 						uint reply_serial = (uint)field_value;
-						PendingCall pending;
 
 						lock (pendingCalls) {
+							PendingCall pending;
 							if (pendingCalls.TryGetValue (reply_serial, out pending)) {
-								if (pendingCalls.Remove (reply_serial)) {
-									pending.Reply = msg;
-									if (pending.KeepFDs)
-										cleanupFDs = false; // caller is responsible for closing FDs
-								}
-
+								if (!pendingCalls.Remove (reply_serial))
+									return;
+								pending.Reply = msg;
+								if (pending.KeepFDs)
+									cleanupFDs = false; // caller is responsible for closing FDs
 								return;
 							}
 						}
@@ -391,17 +413,19 @@ namespace DBus
 				//this is messy and inefficient
 				List<string> linkNodes = new List<string> ();
 				int depth = method_call.Path.Decomposed.Length;
-				foreach (ObjectPath pth in registeredObjects.Keys) {
-					if (pth.Value == (method_call.Path.Value)) {
-						ExportObject exo = (ExportObject)registeredObjects[pth];
-						exo.WriteIntrospect (intro);
-					} else {
-						for (ObjectPath cur = pth ; cur != null ; cur = cur.Parent) {
-							if (cur.Value == method_call.Path.Value) {
-								string linkNode = pth.Decomposed[depth];
-								if (!linkNodes.Contains (linkNode)) {
-									intro.WriteNode (linkNode);
-									linkNodes.Add (linkNode);
+				lock (registeredObjects) {
+					foreach (ObjectPath pth in registeredObjects.Keys) {
+						if (pth.Value == (method_call.Path.Value)) {
+							ExportObject exo = (ExportObject) registeredObjects [pth];
+							exo.WriteIntrospect (intro);
+						} else {
+							for (ObjectPath cur = pth; cur != null; cur = cur.Parent) {
+								if (cur.Value == method_call.Path.Value) {
+									string linkNode = pth.Decomposed [depth];
+									if (!linkNodes.Contains (linkNode)) {
+										intro.WriteNode (linkNode);
+										linkNodes.Add (linkNode);
+									}
 								}
 							}
 						}
@@ -415,12 +439,14 @@ namespace DBus
 				return;
 			}
 
-			BusObject bo;
-			if (registeredObjects.TryGetValue (method_call.Path, out bo)) {
-				ExportObject eo = (ExportObject)bo;
-				eo.HandleMethodCall (method_call);
-			} else {
-				MaybeSendUnknownMethodError (method_call);
+			lock (registeredObjects) {
+				BusObject bo;
+				if (registeredObjects.TryGetValue(method_call.Path, out bo)) {
+					ExportObject eo = (ExportObject)bo;
+					eo.HandleMethodCall (method_call);
+				} else {
+					MaybeSendUnknownMethodError (method_call);
+				}
 			}
 		}
 
@@ -459,17 +485,19 @@ namespace DBus
 			eo.Registered = true;
 
 			//TODO: implement some kind of tree data structure or internal object hierarchy. right now we are ignoring the name and putting all object paths in one namespace, which is bad
-			registeredObjects[path] = eo;
+			lock (registeredObjects)
+				registeredObjects[path] = eo;
 		}
 
 		public object Unregister (ObjectPath path)
 		{
 			BusObject bo;
 
-			if (!registeredObjects.TryGetValue (path, out bo))
-				throw new Exception ("Cannot unregister " + path + " as it isn't registered");
-
-			registeredObjects.Remove (path);
+			lock (registeredObjects) {
+				if (!registeredObjects.TryGetValue (path, out bo))
+					throw new Exception ("Cannot unregister " + path + " as it isn't registered");
+				registeredObjects.Remove (path);
+			}
 
 			ExportObject eo = (ExportObject)bo;
 			eo.Registered = false;
